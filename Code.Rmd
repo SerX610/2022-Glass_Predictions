@@ -1,0 +1,420 @@
+---
+title: "Codi"
+author: "Sergio Cárdenas & Jan Sallent"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Llegim les llibreries necessàries per l'execució del nostre codi
+
+```{r}
+library(ggplot2)
+library(corrplot)
+library(GGally)
+library(splitstackshape)
+library(TunePareto)
+library(MASS)
+library(e1071)
+library(glmnet)
+library(dplyr)
+library(heplots)
+library(caret)
+```
+
+Llegim les dades i veiem el seu format
+
+```{r}
+set.seed(1)
+data <- read.csv("vidre.arff", header=TRUE, comment.char="@")
+head(data)
+```
+
+Declarem la variable `Class` com a factor
+
+```{r}
+data$Class = as.factor(data$Class)
+```
+
+#PREPROCESSAT
+
+Fem un summary de les dades per veure el comportament de les diferents variables
+
+```{r}
+summary(data)
+```
+
+Escalem les dades
+
+```{r}
+data$RI = scale(data$RI)
+data$Na = scale(data$Na)
+data$Mg = scale(data$Mg)
+data$Al = scale(data$Al)
+data$Si = scale(data$Si)
+data$K = scale(data$K)
+data$Ca = scale(data$Ca)
+data$Ba = scale(data$Ba)
+data$Fe = scale(data$Fe)
+```
+
+```{r}
+summary(data)
+```
+
+Dividim les nostres dades en un set de Training i un de Test, mantenint les proporcions de la variable resposta `Class`
+
+```{r message=FALSE, warning=FALSE}
+split <- stratified(data,"Class",0.1, bothSets = TRUE)
+datatrain <- split$SAMP2
+datatest <- split$SAMP1
+```
+
+Fem un plot de les correlacions de les variables del datatrain
+
+```{r}
+correlations <- cor(datatrain[, 1:9])
+corrplot(correlations, method = "shade")
+```
+
+Comprovem la correlació entre RI i Ca
+
+```{r}
+correlations["RI","Ca"]
+```
+
+Eliminem el `Ca` del datatrain i del datatest
+
+```{r}
+datatrain = subset(datatrain, select = -c(Ca))
+datatest = subset(datatest, select = -c(Ca))
+```
+
+Tornem a fer un plot de les correlacions de les variables del datatrain per comprovar que no hi ha cap significativa
+
+```{r}
+corrplot(cor(datatrain[, 1:8]), method = "shade")
+```
+
+#MODELS
+
+##LDA/QDA
+
+Fem un ggpairs del datatrain per veure gràficament el comportament de les variables i les seves distribucions
+
+```{r message=FALSE, warning=FALSE}
+ggpairs(datatrain)
+```
+
+Realitzem un Box's M test per validar o descartar la hipòtesi de la igualtat de variàncies
+
+```{r}
+boxM(cbind(RI, Na, Mg, Al, Si, K, Ba, Fe) ~ Class , datatrain)
+```
+
+Calculem els priors, és a dir, el percentatge que representa cada classe de la variable resposta dins el datatrain
+
+```{r}
+positives <- sum(datatrain$Class == "P")
+negatives <- sum(datatrain$Class == "N")
+prior.1 <- positives/nrow(datatrain)
+prior.2 <- negatives/nrow(datatrain)
+priors <- c(prior.1,prior.2)
+```
+
+Plantejem un model QDA a partir del datatrain i validem la seva accuracy mitjançant LOOCV (Leave-One-Out-Cross-Validation)
+
+```{r}
+qda.LOOCV <- qda(Class ~ ., data = datatrain, prior=priors, CV=TRUE)
+ct <- table(datatrain$Class, qda.LOOCV$class)
+cat("Accuracy del model QDA:", (qda.LOOCV.accuracy <- sum(diag(prop.table(ct))))*100, "%")
+```
+
+Printem la matriu de confusió d'aquest model
+
+```{r}
+confMat <- confusionMatrix(qda.LOOCV$class, datatrain$Class)
+confMat$table
+```
+
+Calculem el percentatge d'observacions negatives i positives ben classificades
+
+```{r}
+NegAcc <- round(confMat$table[1,1]/sum(confMat$table[,1])*100,2)
+PosAcc <- round(confMat$table[2,2]/sum(confMat$table[,2])*100,2)
+cat("Percentatge d'observacions negatives ben classificades:", NegAcc, "%\nPercentatge d'observacions positives ben classificades:", PosAcc, "%")
+```
+
+##SVM
+
+###KERNEL LINEAL
+
+Plantejem un model SVM utilitzant un kernel lineal a partir del datatrain i validem la seva accuracy mitjançant LOOCV (Leave-One-Out-Cross-Validation)
+
+```{r}
+
+#Declarem els vectors on emmagatzemarem l'error de training i validació per a cadascun dels valors de la variable cost del SVM
+
+tr_vector <- c()
+va_vector <- c()
+
+# Iterem per a diferents valors de la variable i, que representarà el cost del SVM
+
+for (i in seq (from=0.5, to=10, by=0.5)){
+  
+  # Realitzem la partició de les dades i declarem la matriu on emmagatzemarem els resultats
+
+  CV.folds <- generateCVRuns(datatrain$Class, ntimes=1, nfold=nrow(datatrain), stratified=TRUE)
+  cv.results <- matrix(rep(0,4*nrow(datatrain)),nrow=nrow(datatrain))
+  colnames (cv.results) <- c("k","fold","TR error","VA error")
+  cv.results[,"TR error"] <- 0
+  cv.results[,"VA error"] <- 0
+  cv.results[,"k"] <- i
+  
+  # Iterem per fer LOOCV
+
+  for (j in 1:nrow(datatrain))
+  {
+    # Obtenim el set de validació
+    
+    va <- unlist(CV.folds[[1]][[j]])
+   
+    # Plantejem el model mitjançant el set de training
+
+    svm_model <- svm(Class ~ ., data = datatrain[-va,], cost = i, kernel = "linear")
+    
+    # Fem la predicció del model pel set de training
+
+    pred.va <- predict(svm_model, datatrain[-va,])
+    
+    # Calculem i emmagatzemem l'error de training
+
+    tab <- table(datatrain[-va,]$Class, pred.va)
+    cv.results[j,"TR error"] <- 1-sum(tab[row(tab)==col(tab)])/sum(tab)
+    
+    # Fem la predicció del model pel set de validació
+    
+    pred.va <- predict(svm_model, datatrain[va,])
+
+    # Calculem i emmagatzemem l'error de validació
+
+    tab <- table(datatrain[va,]$Class, pred.va)
+    cv.results[j,"VA error"] <- 1-sum(tab[row(tab)==col(tab)])/sum(tab)
+    
+    # Emmagatzemem el valor de la iteració
+
+    cv.results[j,"fold"] <- j
+
+  }
+  
+  # Emmagatzemem els valors per al valor actual de la variable cost 
+
+  tr_vector = c(tr_vector, mean(cv.results[,"TR error"]))
+  va_vector = c(va_vector, mean(cv.results[,"VA error"])) 
+}
+
+# Fem el plot dels resultats
+
+i <- seq (from=0.5, to=10, by=0.5)
+plot(i, 1-tr_vector,type="b", col = "red",  ylim = c(0.5, 1), xlab="Cost value", ylab= "")
+par(new=TRUE)
+plot(i, 1-va_vector, type="b", col = "green", ylim = c(0.5, 1), xlab= "", ylab= "Accuracy")
+legend("topleft", legend=c("Training accuracy", "Validation accuracy"), pch=c(1,1), col=c("red", "green"))
+```
+
+Calculem la seva matriu de confusió
+
+```{r}
+best_model <- svm(Class ~ ., data = datatrain, kernel = "linear")
+Prediction <- predict(best_model, datatrain)
+Reference <- datatrain$Class
+table(Prediction, Reference)
+```
+
+###KERNEL POLINÒMIC
+
+Plantejem un model SVM utilitzant un kernel polinòmic a partir del datatrain i validem la seva accuracy mitjançant LOOCV (Leave-One-Out-Cross-Validation)
+
+```{r}
+
+#Declarem els vectors on emmagatzemarem l'error de training i validació per a cadascun dels valors de la variable cost del SVM
+
+tr_vector <- c()
+va_vector <- c()
+
+# Iterem per a diferents valors de la variable i, que representarà el cost del SVM
+
+for (i in seq (from=0.5, to=10, by=0.5)){
+  
+  # Realitzem la partició de les dades i declarem la matriu on emmagatzemarem els resultats
+  
+  CV.folds <- generateCVRuns(datatrain$Class, ntimes=1, nfold=nrow(datatrain), stratified=TRUE)
+  cv.results <- matrix(rep(0,4*nrow(datatrain)),nrow=nrow(datatrain))
+  colnames (cv.results) <- c("k","fold","TR error","VA error")
+  cv.results[,"TR error"] <- 0
+  cv.results[,"VA error"] <- 0
+  cv.results[,"k"] <- i
+  
+  # Iterem per fer LOOCV
+  
+  for (j in 1:nrow(datatrain))
+  {
+    
+    # Obtenim el set de validació
+    
+    va <- unlist(CV.folds[[1]][[j]])
+   
+    # Plantejem el model mitjançant el set de training
+    
+    svm_model <- svm(Class ~ ., data = datatrain[-va,], cost = i, kernel = "polynomial", coef0=1)
+    
+    # Fem la predicció del model pel set de training
+
+    pred.va <- predict(svm_model, datatrain[-va,])
+    
+    # Calculem i emmagatzemem l'error de training
+
+    tab <- table(datatrain[-va,]$Class, pred.va)
+    cv.results[j,"TR error"] <- 1-sum(tab[row(tab)==col(tab)])/sum(tab)
+    
+    # Fem la predicció del model pel set de validació
+    
+    pred.va <- predict(svm_model, datatrain[va,])
+
+    # Calculem i emmagatzemem l'error de validació
+
+    tab <- table(datatrain[va,]$Class, pred.va)
+    cv.results[j,"VA error"] <- 1-sum(tab[row(tab)==col(tab)])/sum(tab)
+    
+    # Emmagatzemem el valor de la iteració
+
+    cv.results[j,"fold"] <- j
+
+  }
+  
+  # Emmagatzemem els valors per al valor actual de la variable cost 
+  
+  tr_vector = c(tr_vector, mean(cv.results[,"TR error"]))
+  va_vector = c(va_vector, mean(cv.results[,"VA error"])) 
+}
+
+# Fem el plot dels resultats
+
+i <- seq (from=0.5, to=10, by=0.5)
+plot(i, 1-tr_vector,type="b", col = "red",  ylim = c(0.5, 1), xlab="Cost value", ylab= "")
+par(new=TRUE)
+plot(i, 1-va_vector, type="b", col = "green", ylim = c(0.5, 1), xlab= "", ylab= "Accuracy")
+legend("topleft", legend=c("Training accuracy", "Validation accuracy"), pch=c(1,1), col=c("red", "green"))
+```
+
+Calculem la seva matriu de confusió
+
+```{r}
+best_model <- svm(Class ~ ., data = datatrain, cost = 4, kernel = "polynomial", coef0 = 1)
+Prediction <- predict(best_model, datatrain)
+Reference <- datatrain$Class
+table(Prediction, Reference)
+```
+
+###KERNEL RADIAL
+
+Plantejem un model SVM utilitzant un kernel radial a partir del datatrain i validem la seva accuracy mitjançant LOOCV (Leave-One-Out-Cross-Validation)
+
+```{r}
+
+#Declarem els vectors on emmagatzemarem l'error de training i validació per a cadascun dels valors de la variable cost del SVM
+
+tr_vector <- c()
+va_vector <- c()
+
+# Iterem per a diferents valors de la variable i, que representarà el cost del SVM
+
+for (i in seq (from=0.5, to=10, by=0.5)){
+  
+  # Realitzem la partició de les dades i declarem la matriu on emmagatzemarem els resultats
+
+  CV.folds <- generateCVRuns(datatrain$Class, ntimes=1, nfold=nrow(datatrain), stratified=TRUE)
+  cv.results <- matrix(rep(0,4*nrow(datatrain)),nrow=nrow(datatrain))
+  colnames (cv.results) <- c("k","fold","TR error","VA error")
+  cv.results[,"TR error"] <- 0
+  cv.results[,"VA error"] <- 0
+  cv.results[,"k"] <- i
+  
+  # Iterem per fer LOOCV
+
+  for (j in 1:nrow(datatrain))
+  {
+    # Obtenim el set de validació
+    
+    va <- unlist(CV.folds[[1]][[j]])
+   
+    # Plantejem el model mitjançant el set de training
+
+    svm_model <- svm(Class ~ ., data = datatrain[-va,], cost = i, kernel = "radial", gamma = 1/4)
+    
+    # Fem la predicció del model pel set de training
+
+    pred.va <- predict(svm_model, datatrain[-va,])
+    
+    # Calculem i emmagatzemem l'error de training
+
+    tab <- table(datatrain[-va,]$Class, pred.va)
+    cv.results[j,"TR error"] <- 1-sum(tab[row(tab)==col(tab)])/sum(tab)
+    
+    # Fem la predicció del model pel set de validació
+    
+    pred.va <- predict(svm_model, datatrain[va,])
+
+    # Calculem i emmagatzemem l'error de validació
+
+    tab <- table(datatrain[va,]$Class, pred.va)
+    cv.results[j,"VA error"] <- 1-sum(tab[row(tab)==col(tab)])/sum(tab)
+    
+    # Emmagatzemem el valor de la iteració
+
+    cv.results[j,"fold"] <- j
+
+  }
+  
+  # Emmagatzemem els valors per al valor actual de la variable cost 
+
+  tr_vector = c(tr_vector, mean(cv.results[,"TR error"]))
+  va_vector = c(va_vector, mean(cv.results[,"VA error"])) 
+}
+
+# Fem el plot dels resultats
+
+i <- seq (from=0.5, to=10, by=0.5)
+plot(i, 1-tr_vector, type="b", col = "red",  ylim = c(0.5, 1), xlab="Cost value", ylab= "")
+par(new=TRUE)
+plot(i, 1-va_vector, type="b", col = "green", ylim = c(0.5, 1), xlab= "", ylab= "Accuracy")
+legend("topleft", legend=c("Training accuracy", "Validation accuracy"), pch=c(1,1), col=c("red", "green"))
+```
+
+Calculem la seva matriu de confusió
+
+```{r}
+best_model <- svm(Class ~ ., data = datatrain, cost = 1, kernel = "radial", gamma = 1/4)
+Prediction <- predict(best_model, datatrain)
+Reference <- datatrain$Class
+table(Prediction, Reference)
+```
+
+#MODEL ESCOLLIT
+
+Comprovem l'accuracy del model triat (polinòmic) per al valor òptim de l'hiperparàmetre cost
+
+```{r}
+best_model <- svm(Class ~ ., data = datatrain, cost = 4, kernel = "polynomial", coef0 = 1)
+Prediction <- predict(best_model, datatest)
+Reference <- datatest$Class
+cat("Accuracy del model SVM amb kernel polinòmic:", (sum(tab[row(tab)==col(tab)])/sum(tab))*100, "%")
+```
+
+```{r}
+table(Prediction, Reference)
+```
+
